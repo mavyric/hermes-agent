@@ -1607,6 +1607,17 @@ def _resolve_task_provider_model(
                 _sbu = comp.get("summary_base_url") or ""
                 cfg_base_url = cfg_base_url or _sbu.strip() or None
 
+        # Inherit from main model configuration if no auxiliary-specific provider set
+        if task and cfg_provider is None:
+            # For vision, keep default "auto" (vision-capable auto-detection)
+            if task == "vision":
+                cfg_provider = "auto"
+            else:
+                main_model = _read_main_model()
+                if main_model:
+                    cfg_provider = "main"
+                    cfg_model = cfg_model or main_model
+
     env_model = _get_auxiliary_env_override(task, "MODEL") if task else None
     resolved_model = model or env_model or cfg_model
 
@@ -1776,26 +1787,74 @@ def call_llm(
             api_key=resolved_api_key,
         )
         if client is None:
-            # When the user explicitly chose a non-OpenRouter provider but no
-            # credentials were found, fail fast instead of silently routing
-            # through OpenRouter (which causes confusing 404s).
-            _explicit = (resolved_provider or "").strip().lower()
-            if _explicit and _explicit not in ("auto", "openrouter", "custom"):
+            # Determine if provider was explicitly provided (argument or config) for strict mode
+            explicit_provider = None
+            if provider:
+                explicit_provider = provider.strip().lower()
+            elif task:
+                try:
+                    from hermes_cli.config import load_config
+                    cfg = load_config()
+                    aux = cfg.get("auxiliary", {})
+                    task_cfg = aux.get(task, {}) if isinstance(aux, dict) else {}
+                    if isinstance(task_cfg, dict):
+                        p = str(task_cfg.get("provider", "")).strip()
+                        if p:
+                            explicit_provider = p.lower()
+                except Exception:
+                    pass
+
+            # If explicit provider (and not auto/openrouter/custom), fail immediately
+            if explicit_provider and explicit_provider not in ("auto", "openrouter", "custom"):
                 raise RuntimeError(
-                    f"Provider '{_explicit}' is set in config.yaml but no API key "
-                    f"was found. Set the {_explicit.upper()}_API_KEY environment "
+                    f"Provider '{explicit_provider}' is set in config.yaml but no API key "
+                    f"was found. Set the {explicit_provider.upper()}_API_KEY environment "
                     f"variable, or switch to a different provider with `hermes model`."
                 )
-            # For auto/custom, fall back to OpenRouter
-            if not resolved_base_url:
-                logger.info("Auxiliary %s: provider %s unavailable, falling back to openrouter",
-                            task or "call", resolved_provider)
+
+            # Try fallback chain from config if available
+            fallback_chain = []
+            try:
+                from hermes_cli.config import load_config
+                cfg = load_config()
+                fb = cfg.get("fallback_providers", [])
+                if isinstance(fb, list):
+                    fallback_chain = fb
+                elif isinstance(fb, dict):
+                    fallback_chain = [fb]
+            except Exception:
+                fallback_chain = []
+
+            for entry in fallback_chain:
+                p = entry.get("provider")
+                m = entry.get("model")
+                if not p:
+                    continue
+                # Skip if this is the same as the already-failed provider/model
+                if p == resolved_provider and m == resolved_model:
+                    continue
+                client, final_model = _get_cached_client(p, m)
+                if client is not None:
+                    resolved_provider = p
+                    final_model = final_model or m
+                    break
+
+            # If still no client and not using a custom base_url, fall back to OpenRouter (backward compatibility)
+            if client is None and not resolved_base_url:
+                logger.info(
+                    "Auxiliary %s: provider %s unavailable, falling back to openrouter",
+                    task or "call",
+                    resolved_provider,
+                )
                 client, final_model = _get_cached_client(
-                    "openrouter", resolved_model or _OPENROUTER_MODEL)
-        if client is None:
-            raise RuntimeError(
-                f"No LLM provider configured for task={task} provider={resolved_provider}. "
-                f"Run: hermes setup")
+                    "openrouter", resolved_model or _OPENROUTER_MODEL
+                )
+
+            if client is None:
+                raise RuntimeError(
+                    f"No LLM provider configured for task={task} provider={resolved_provider}. "
+                    f"Run: hermes setup"
+                )
 
     effective_timeout = timeout if timeout is not None else _get_task_timeout(task)
 
@@ -1934,23 +1993,74 @@ async def async_call_llm(
             api_key=resolved_api_key,
         )
         if client is None:
-            _explicit = (resolved_provider or "").strip().lower()
-            if _explicit and _explicit not in ("auto", "openrouter", "custom"):
+            # Determine if provider was explicitly provided (argument or config) for strict mode
+            explicit_provider = None
+            if provider:
+                explicit_provider = provider.strip().lower()
+            elif task:
+                try:
+                    from hermes_cli.config import load_config
+                    cfg = load_config()
+                    aux = cfg.get("auxiliary", {})
+                    task_cfg = aux.get(task, {}) if isinstance(aux, dict) else {}
+                    if isinstance(task_cfg, dict):
+                        p = str(task_cfg.get("provider", "")).strip()
+                        if p:
+                            explicit_provider = p.lower()
+                except Exception:
+                    pass
+
+            # If explicit provider (and not auto/openrouter/custom), fail immediately
+            if explicit_provider and explicit_provider not in ("auto", "openrouter", "custom"):
                 raise RuntimeError(
-                    f"Provider '{_explicit}' is set in config.yaml but no API key "
-                    f"was found. Set the {_explicit.upper()}_API_KEY environment "
+                    f"Provider '{explicit_provider}' is set in config.yaml but no API key "
+                    f"was found. Set the {explicit_provider.upper()}_API_KEY environment "
                     f"variable, or switch to a different provider with `hermes model`."
                 )
-            if not resolved_base_url:
-                logger.warning("Provider %s unavailable, falling back to openrouter",
-                               resolved_provider)
+
+            # Try fallback chain from config if available
+            fallback_chain = []
+            try:
+                from hermes_cli.config import load_config
+                cfg = load_config()
+                fb = cfg.get("fallback_providers", [])
+                if isinstance(fb, list):
+                    fallback_chain = fb
+                elif isinstance(fb, dict):
+                    fallback_chain = [fb]
+            except Exception:
+                fallback_chain = []
+
+            for entry in fallback_chain:
+                p = entry.get("provider")
+                m = entry.get("model")
+                if not p:
+                    continue
+                if p == resolved_provider and m == resolved_model:
+                    continue
                 client, final_model = _get_cached_client(
-                    "openrouter", resolved_model or _OPENROUTER_MODEL,
-                    async_mode=True)
-        if client is None:
-            raise RuntimeError(
-                f"No LLM provider configured for task={task} provider={resolved_provider}. "
-                f"Run: hermes setup")
+                    p, m, async_mode=True
+                )
+                if client is not None:
+                    resolved_provider = p
+                    final_model = final_model or m
+                    break
+
+            # If still no client and not using a custom base_url, fall back to OpenRouter (backward compatibility)
+            if client is None and not resolved_base_url:
+                logger.warning(
+                    "Provider %s unavailable, falling back to openrouter",
+                    resolved_provider,
+                )
+                client, final_model = _get_cached_client(
+                    "openrouter", resolved_model or _OPENROUTER_MODEL, async_mode=True
+                )
+
+            if client is None:
+                raise RuntimeError(
+                    f"No LLM provider configured for task={task} provider={resolved_provider}. "
+                    f"Run: hermes setup"
+                )
 
     effective_timeout = timeout if timeout is not None else _get_task_timeout(task)
 

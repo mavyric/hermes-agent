@@ -305,8 +305,9 @@ DEFAULT_CONFIG = {
     # Format: provider is the provider name, model is the model slug.
     # "auto" for provider = auto-detect best available provider.
     # Empty model = use provider's default auxiliary model.
-    # All tasks fall back to openrouter:google/gemini-3-flash-preview if
-    # the configured provider is unavailable.
+    # If provider is not set, the task inherits the main model configuration
+    # (model.default + provider) and uses the global fallback_providers chain
+    # when the primary is unavailable.
     "auxiliary": {
         "vision": {
             "provider": "auto",    # auto | openrouter | nous | codex | custom
@@ -1849,6 +1850,9 @@ _FALLBACK_COMMENT = """
 # fallback_model:
 #   provider: openrouter
 #   model: anthropic/claude-sonnet-4
+#
+# Also used by auxiliary tasks (web_extract, compression, etc.) when they
+# inherit the main model configuration or when their primary provider fails.
 #
 # ── Smart Model Routing ────────────────────────────────────────────────
 # Optional cheap-vs-strong routing for simple turns.
