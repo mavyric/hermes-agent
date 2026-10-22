@@ -123,13 +123,31 @@ class TestSSHBulkDownload:
 
         assert "--exclude='*.sock'" in " ".join(mock_run.call_args[0][0])
 
+    def test_ssh_bulk_download_tolerates_file_changed_exit_1(self, ssh_mock_env, tmp_path):
+        """rc=1 is tar's warning status: on a hot tree (loopback SSH backends archive a live
+        home, and the sync-back temp tar sits inside it) 'file changed as we read it' lines
+        must not fail the transfer — the archive is usable and the next sync re-pulls any
+        torn file. The scratch exclusion must also be present so the output tar is never
+        archived into itself."""
+        dest = tmp_path / "backup.tar"
+        stderr = (b"tar: home/testuser/.hermes/cache/scratch: file changed as we read it\n"
+                  b"tar: home/testuser/.hermes: file changed as we read it\n")
+        completed = subprocess.CompletedProcess([], 1, stderr=stderr)
+
+        with patch.object(subprocess, "run", return_value=completed) as mock_run:
+            ssh_mock_env._ssh_bulk_download(dest)  # must not raise
+
+        assert "--exclude='*/cache/scratch/*'" in " ".join(mock_run.call_args[0][0])
+
     def test_ssh_bulk_download_still_fails_on_every_other_status(self, ssh_mock_env, tmp_path):
-        """rc=1; rc=2 with a real error beside the socket line, with no diagnostic at all, or
-        with 'socket ignored' merely inside a filename — all still raise."""
+        """rc=1 with a real error (even with the warning phrase merely inside a filename);
+        rc=2 with a real error beside the socket line, with no diagnostic at all, or with
+        'socket ignored' merely inside a filename — all still raise."""
         from tools.environments.base import EnvironmentConnectionError
         dest = tmp_path / "backup.tar"
         failures = (
-            subprocess.CompletedProcess([], 1, stderr=b"tar: home/testuser/.hermes/state.db: file changed as we read it"),
+            subprocess.CompletedProcess([], 1, stderr=b"tar: home/testuser/.hermes/state.db: Cannot open: Permission denied"),
+            subprocess.CompletedProcess([], 1, stderr=b"tar: home/testuser/.hermes/file changed as we read it.db: Cannot open\n"),
             subprocess.CompletedProcess([], 2, stderr=(b"tar: home/testuser/.hermes/gateway.sock: socket ignored\n"
                                                       b"tar: home/testuser/.hermes/state.db: Cannot open: Permission denied\n")),
             subprocess.CompletedProcess([], 2, stderr=b"\n"),

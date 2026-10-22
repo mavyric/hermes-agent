@@ -252,18 +252,29 @@ class SSHEnvironment(BaseEnvironment):
         # Live sockets inside .hermes (gateway.sock and friends) cannot be archived: tar prints
         # "socket ignored" and some builds exit 2, which failed every sync-back and left a
         # multi-GB temp tar behind on each retry. Exclude them up front.
+        # cache/scratch is also excluded: the local sync-back temp tar lands under the remote
+        # .hermes tree whenever the SSH backend resolves to the same home (loopback deploys),
+        # and tar then reads its own growing output — "file changed as we read it", exit 1,
+        # every attempt. Scratch is Hermes-managed temporary space; nothing durable lives there.
         ssh_cmd = self._build_ssh_command() + [
-            f"tar cf - --exclude='*.sock' -C / {shlex.quote(rel_base)}"]
+            f"tar cf - --exclude='*.sock' --exclude='*/cache/scratch/*' -C / {shlex.quote(rel_base)}"]
         with open(dest, "wb") as f:
             result = subprocess.run(ssh_cmd, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.PIPE, timeout=120, check=False)
         if result.returncode != 0:
             stderr = result.stderr.decode(errors="replace").strip()
-            # A socket not named *.sock is the only rc=2 we knowingly accept, and only when
-            # nothing else was reported — anchored to the diagnostic suffix so a filename merely
-            # containing "socket ignored" cannot sneak through. Every other status still fails.
+            # rc=2: a socket not named *.sock is the only one we knowingly accept.
+            # rc=1: tar's warning status — e.g. "file changed as we read it" when the remote
+            # .hermes tree is a live, actively-written home (loopback SSH backends). The archive
+            # is still usable and the next sync re-pulls any torn file, so a hot tree must not
+            # fail every sync-back. Both are accepted only when nothing else was reported —
+            # anchored to the diagnostic suffix so a filename merely containing the phrase
+            # cannot sneak through. Every other status still fails.
             diagnostic_lines = [line for line in stderr.splitlines() if line.strip()]
-            tolerated = result.returncode == 2 and bool(diagnostic_lines) and all(
-                line.endswith(": socket ignored") for line in diagnostic_lines)
+            warning_suffixes = (": socket ignored", ": file changed as we read it")
+            tolerated = result.returncode in (1, 2) and bool(diagnostic_lines) and all(
+                line.endswith(warning_suffixes) for line in diagnostic_lines)
+            if tolerated:
+                logger.debug("sync_back: tolerated tar warning(s): %s", stderr)
             if not tolerated:
                 raise _sync_error(f"SSH bulk download failed: {stderr}",
                                   f"File sync from {self.host}")
